@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+
+from collections import deque
+import gzip
+import ssl
+import argparse
+import socket
+import os
+from urllib.parse import urlparse
+from html.parser import HTMLParser
+
+DEFAULT_SERVER = "project5.3700.network"
+DEFAULT_PORT = 443
+FLAGS = "secret_flags"
+BUFFER = 1460000
+CRLF = "\r\n\r\n"
+
+# HTTP Status Codes
+OK = str(200)
+FOUND = str(302)
+FORBIDDEN = str(403)
+NOT_FOUND = str(404)
+SERVER_ERROR = str(500)
+
+# non-constant global vars
+csrf_token = None
+csrf_middleware_token = None
+visited_pages = {}
+session_id = None
+flags = 0
+num_visited = 0
+
+class MyHTMLParser(HTMLParser):
+
+    def __init__(self):
+        HTMLParser.__init__(self)
+        self.flags = set()
+        self.paths = set()
+
+    def handle_starttag(self, tag, attrs):
+        global csrf_middleware_token
+        global pages_to_visit
+        if tag == "input" and attrs[1] == ("name", "csrfmiddlewaretoken"):
+            csrf_middleware_token = attrs[2][1]
+       
+        elif tag == "a" and attrs[0][0] == "href":
+            url = attrs[0][1]
+            if url not in visited_pages.keys() and "/fakebook/" in url:
+                #visited_pages[attrs[0][1]] = False
+                self.paths.add(attrs[0][1])
+
+    def handle_data(self, data):
+        global flags
+
+        if "FLAG:" in data:
+            print(data[6:])
+            with open(FLAGS, 'r+') as secret_flags:
+                #print("opened file")
+                line_exists = False
+                for line in secret_flags:
+                    if data[6:] in secret_flags:
+                        line_exists = True
+
+                if line_exists == False:
+                    secret_flags.write(data[6:])
+                    secret_flags.write('\n')
+                    secret_flags.close()
+            flags += 1
+            self.flags.add(data[6:])
+
+class Crawler:
+    def __init__(self, args):
+        self.server = args.server
+        self.port = args.port
+        self.username = args.username
+        self.password = args.password
+        self.parser = MyHTMLParser()
+        self.__socket() 
+
+    def __socket(self):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if self.port == 443:
+            self.socket = ssl.wrap_socket(self.socket)
+        self.socket.connect((self.server, self.port))
+
+    def __write_cookie(self):
+        global csrf_token
+        global session_id
+
+        if session_id == None and csrf_token == None:
+            return ""
+        elif session_id == None:
+            return "csrftoken=%s" % csrf_token
+        return "sessionid=%s; csrftoken=%s" % (session_id, csrf_token)
+
+    def __send(self, request):
+        #sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        #if self.port == 443:
+            #sock = ssl.wrap_socket(sock)
+        #self.socket.connect((self.server, self.port))
+        self.socket.send(request.encode())
+        data = self.socket.recv(BUFFER).decode()
+        #while (CRLF not in data):
+            #second_data = sock.recv(BUFFER).decode()
+            #data = data + second_data
+        #sock.shutdown(1)
+        #sock.close()
+        return data
+
+    def __serialize(self, data):
+        global session_id
+        global csrf_token
+
+        parsed_data = {}
+        response = data.split(CRLF)
+        response_headers = response[0].split("\r\n")
+       
+        parsed_data["body"] = response[1]
+        parsed_data["headers"] = {} 
+
+        for header in response_headers:
+            # check to see if first header; contains the status code
+            if header[:8] == "HTTP/1.1":
+                parsed_data["headers"]["Status"] = header.split(" ")[1]
+                continue
+
+            # Set-Cookie header
+            key_value = header.split(": ")
+            if key_value[0] == "Set-Cookie":
+                value = key_value[1].split("; ")[0]
+                
+                if "sessionid" in value:
+                    session_id = value.split("=")[1]
+                elif "csrftoken" in value:
+                    csrf_token = value.split("=")[1]
+
+                continue
+
+            # normal headers
+            parsed_data["headers"][key_value[0]] = key_value[1]
+
+        # check if connection has been closed
+        if parsed_data["headers"]["Connection"] == "close":
+            self.__socket()
+
+        return parsed_data
+
+    def __post(self, url, body):
+        url = urlparse(url)
+        if url.path == "":
+            path = "/"
+        else:
+            path = url.path
+        
+        if url.query:
+            path = "%s?%s" % (path, url.query)
+
+        method = "POST %s HTTP/1.1\n" % (path)
+        host = "Host: %s\n" % (DEFAULT_SERVER)
+        referer = "Referer: https://%s/accounts/login/?next=/fakebook/\n" % self.server
+        sender = "From: %s@northeastern.edu\n" % (self.username)
+        user_agent = "User-Agent: cs3700crawler/1.0\n"
+        content_type = "Content-Type: application/x-www-form-urlencoded\n"
+        content_length = "Content-Length: %s\n" % (len(body))
+        cookie = "Cookie: %s\n\n" % self.__write_cookie()
+
+        headers = "%s%s%s%s%s%s%s%s" % (method, host, referer, sender, user_agent, content_type, content_length, cookie)
+        request = "%s%s%s" % (headers, body, CRLF)
+        
+        #print("Sending POST request: \n%s" % request)
+        data = self.__send(request)
+
+        #print("POST request response: \n%s" %data)
+        return self.__serialize(data)
+
+    def __get(self, url):
+        url = urlparse(url)
+        if url.path == "":
+            path = "/"
+        else:
+            path = url.path
+
+        if url.query:
+            path = "%s?%s" % (path, url.query)
+
+        method = "GET %s HTTP/1.1\n" % (path)
+        host = "Host: %s\n" % (DEFAULT_SERVER)
+        sender = "From: %s@northeastern.edu\n" % (self.username)
+        user_agent = "User-Agent: cs3700crawler/1.0\n"
+        gzip = "Accept-Encoding: gzip\n"
+        cookie = "Cookie: %s\n\n" % self.__write_cookie()
+
+        headers = "%s%s%s%s%s" % (method, host, sender, user_agent, cookie)
+        #headers = "%s%s%s%s%s%s" % (method, host, sender, user_agent, gzip, cookie)
+        request = "%s%s" % (headers, CRLF)
+        
+        #print("Sending GET request: \n%s" % request)
+        
+        data = self.__send(request)
+        #print("GET request response: \n%s" % data)
+        
+        return self.__serialize(data)
+
+    def __crawl(self):
+        global flags
+        global num_visited
+
+        root_url = "https://%s" % self.server
+        home = "/fakebook/"
+        # deque takes O(1) tim for append/pop, vs list O(n)
+        unvisited = deque()
+        unvisited.append(home)
+        # set is an iterable that does not allow duplicate values
+        visited = set()
+
+        #while len(unvisited) > 0:
+        while flags < 5:
+            # pick the next path to follow
+            path = unvisited.popleft()
+            num_visited += 1
+            #print(num_visited)
+            
+            # send the GET request
+            target_url = "%s%s" % (root_url, path)
+            get_response = self.__get(target_url)
+            status = get_response["headers"]["Status"]
+
+            # add path to visited pages
+            visited.add(path)
+
+            if status == OK:
+                self.parser.feed(get_response["body"])
+                for path in self.parser.paths:
+                    if path not in visited and path not in unvisited:
+                        unvisited.append(path)
+                #if flags > 5:
+                    #break
+
+            elif status == FOUND:
+                location = get_response["headers"]["Location"]
+                unvisited.appendleft(location)
+
+            elif status == FORBIDDEN or status == NOT_FOUND:
+                continue
+
+            elif status == SERVER_ERROR:
+                unvisited.appendleft(path)
+
+            else:
+                print(status)
+
+    def __login(self):
+        global csrf_middleware_token
+        global csrf_token
+        global session_id
+        global visited_pages
+
+        login_url = "https://%s:%s/accounts/login/?next=/fakebook/" % (self.server, self.port)
+        get_login_response = self.__get(login_url)
+        
+        # Find the csrf token
+        self.parser.feed(get_login_response["body"])
+
+        post_login_data = "username=%s&password=%s&csrfmiddlewaretoken=%s&next=/fakebook/" % (self.username, self.password, csrf_middleware_token)
+        
+        post_login_response = self.__post(login_url, post_login_data)
+        
+        self.parser.feed(post_login_response["body"])
+        
+        if post_login_response["headers"]["Status"] == FOUND:
+            home_url = "https://%s:%s%s" % (self.server, self.port, post_login_response["headers"]["Location"])   
+            get_home_response = self.__get(home_url)
+        
+            self.parser.feed(get_home_response["body"])
+
+    def run(self):
+        global num_visited
+        #print("Request to %s:%d" % (self.server, self.port))
+        self.__login()
+        self.__crawl()
+        self.socket.close()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='crawl Fakebook')
+    parser.add_argument('-s', dest="server", type=str, default=DEFAULT_SERVER, help="The server to crawl")
+    parser.add_argument('-p', dest="port", type=int, default=DEFAULT_PORT, help="The port to use")
+    parser.add_argument('username', type=str, help="The username to use")
+    parser.add_argument('password', type=str, help="The password to use")
+    args = parser.parse_args()
+    sender = Crawler(args)
+    sender.run()
